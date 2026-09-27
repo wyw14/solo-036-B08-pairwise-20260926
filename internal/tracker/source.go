@@ -103,6 +103,22 @@ func (l *SourceLineage) Observations(runID, stationID string, generation int64) 
 	return out
 }
 
+// Snapshot exports every observation in the lineage in a deterministic order
+// so it can be persisted with the control snapshot and rebuilt on recovery.
+func (l *SourceLineage) Snapshot() []SourceObservation {
+	out := make([]SourceObservation, 0, len(l.observations))
+	for _, observation := range l.observations {
+		out = append(out, observation)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ObservedAt.Equal(out[j].ObservedAt) {
+			return out[i].ObservationID < out[j].ObservationID
+		}
+		return out[i].ObservedAt.Before(out[j].ObservedAt)
+	})
+	return out
+}
+
 func (l *SourceLineage) Evidence(runID, stationID string, generation int64) []model.PassageEvidence {
 	observations := l.Observations(runID, stationID, generation)
 	evidence := make([]model.PassageEvidence, 0, len(observations))

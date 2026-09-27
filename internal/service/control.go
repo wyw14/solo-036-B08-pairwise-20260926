@@ -20,17 +20,18 @@ import (
 )
 
 type ControlState struct {
-	Network    *route.Network
-	Stations   map[string]model.Station
-	Routes     map[string]model.RouteState
-	Valves     map[string]model.ValveState
-	Closures   map[string]model.ClosureState
-	Pressures  map[string]model.PressureState
-	Tracking   map[string][]model.TrackingState
-	Permits    map[string][]model.PermitState
-	Incidents  []model.Incident
-	Revision   string
-	Persistent *journal.FileStore
+	Network      *route.Network
+	Stations     map[string]model.Station
+	Routes       map[string]model.RouteState
+	Valves       map[string]model.ValveState
+	Closures     map[string]model.ClosureState
+	Pressures    map[string]model.PressureState
+	Tracking     map[string][]model.TrackingState
+	Permits      map[string][]model.PermitState
+	DegradedRuns map[string]string
+	Incidents    []model.Incident
+	Revision     string
+	Persistent   *journal.FileStore
 }
 
 type LaunchRequest struct {
@@ -53,27 +54,29 @@ type ReceiveRequest struct {
 }
 
 type RecoveryReport struct {
-	RecoveredRuns    int  `json:"recovered_runs"`
-	RecoveredRoutes  int  `json:"recovered_routes"`
-	RecoveredPermits int  `json:"recovered_permits"`
-	JournalEvents    int  `json:"journal_events"`
-	Ready            bool `json:"ready"`
+	RecoveredRuns    int      `json:"recovered_runs"`
+	RecoveredRoutes  int      `json:"recovered_routes"`
+	RecoveredPermits int      `json:"recovered_permits"`
+	JournalEvents    int      `json:"journal_events"`
+	DegradedRuns     []string `json:"degraded_runs"`
+	Ready            bool     `json:"ready"`
 }
 
 func defaultControlState() *ControlState {
 	network := route.DefaultNetwork()
 	stations := network.Stations()
 	state := &ControlState{
-		Network:   network,
-		Stations:  make(map[string]model.Station),
-		Routes:    make(map[string]model.RouteState),
-		Valves:    make(map[string]model.ValveState),
-		Closures:  make(map[string]model.ClosureState),
-		Pressures: make(map[string]model.PressureState),
-		Tracking:  make(map[string][]model.TrackingState),
-		Permits:   make(map[string][]model.PermitState),
-		Incidents: make([]model.Incident, 0),
-		Revision:  model.NewRevision(),
+		Network:      network,
+		Stations:     make(map[string]model.Station),
+		Routes:       make(map[string]model.RouteState),
+		Valves:       make(map[string]model.ValveState),
+		Closures:     make(map[string]model.ClosureState),
+		Pressures:    make(map[string]model.PressureState),
+		Tracking:     make(map[string][]model.TrackingState),
+		Permits:      make(map[string][]model.PermitState),
+		DegradedRuns: make(map[string]string),
+		Incidents:    make([]model.Incident, 0),
+		Revision:     model.NewRevision(),
 	}
 	for _, station := range stations {
 		state.Stations[station.ID] = station
@@ -353,6 +356,9 @@ func (r *Runtime) GrantPassage(runID, stationID string) (model.OperationRecord, 
 	if _, ok := control.Stations[stationID]; !ok {
 		return model.OperationRecord{}, errors.New("unknown passage station")
 	}
+	if reason, degraded := control.DegradedRuns[runID]; degraded {
+		return model.OperationRecord{}, fmt.Errorf("passage evidence for run %s is degraded: %s; revise tracking and rebuild evidence before granting passage", runID, reason)
+	}
 	generation := r.Tracker.Generation(runID)
 	points := r.Lineage.Evidence(runID, stationID, generation)
 	if len(points) < 2 {
@@ -500,17 +506,18 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	snapshot := model.ControlSnapshot{
-		Revision:   control.Revision,
-		CapturedAt: time.Now().UTC(),
-		Stations:   make([]model.Station, 0, len(control.Stations)),
-		Valves:     make([]model.ValveState, 0, len(control.Valves)),
-		Closures:   make([]model.ClosureState, 0, len(control.Closures)),
-		Pressures:  make([]model.PressureState, 0, len(control.Pressures)),
-		Routes:     make([]model.RouteState, 0, len(control.Routes)),
-		Tracking:   make([]model.TrackingState, 0),
-		Permits:    make([]model.PermitState, 0),
-		Runs:       r.Runs.Snapshot(),
-		Incidents:  append([]model.Incident(nil), control.Incidents...),
+		Revision:     control.Revision,
+		CapturedAt:   time.Now().UTC(),
+		Stations:     make([]model.Station, 0, len(control.Stations)),
+		Valves:       make([]model.ValveState, 0, len(control.Valves)),
+		Closures:     make([]model.ClosureState, 0, len(control.Closures)),
+		Pressures:    make([]model.PressureState, 0, len(control.Pressures)),
+		Routes:       make([]model.RouteState, 0, len(control.Routes)),
+		Tracking:     make([]model.TrackingState, 0),
+		Observations: make([]model.ObservationState, 0),
+		Permits:      make([]model.PermitState, 0),
+		Runs:         r.Runs.Snapshot(),
+		Incidents:    append([]model.Incident(nil), control.Incidents...),
 	}
 	for _, value := range control.Stations {
 		snapshot.Stations = append(snapshot.Stations, value)
@@ -530,6 +537,9 @@ func (r *Runtime) Snapshot() model.ControlSnapshot {
 	}
 	for _, values := range control.Tracking {
 		snapshot.Tracking = append(snapshot.Tracking, values...)
+	}
+	for _, observation := range r.Lineage.Snapshot() {
+		snapshot.Observations = append(snapshot.Observations, observationToModel(observation))
 	}
 	for _, values := range control.Permits {
 		snapshot.Permits = append(snapshot.Permits, values...)
@@ -565,6 +575,12 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		return RecoveryReport{}, err
 	}
 	run.Restore(r.Runs, snapshot.Control.Runs)
+	observations := make([]tracker.SourceObservation, 0, len(snapshot.Control.Observations))
+	for _, state := range snapshot.Control.Observations {
+		observations = append(observations, observationFromModel(state))
+	}
+	unrestorable := tracker.Restore(r.Lineage, r.Tracker, observations)
+	degraded := degradedTrackingRuns(snapshot.Control, unrestorable)
 	leasing := make([]model.RouteLease, 0)
 	for _, routeState := range snapshot.Control.Routes {
 		if routeState.Reserved {
@@ -579,6 +595,9 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	route.Restore(r.Routes, leasing)
 	permitEvents := make([]model.Event, 0)
 	for _, permitState := range snapshot.Control.Permits {
+		if _, isDegraded := degraded[permitState.RunID]; isDegraded {
+			continue
+		}
 		if permitState.Granted {
 			permitEvents = append(permitEvents, model.Event{
 				RunID:   permitState.RunID,
@@ -590,6 +609,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		}
 	}
 	permit.Restore(r.Permits, permitEvents)
+	degradedRuns := sortedDegradedRuns(degraded)
 	r.mu.Lock()
 	r.control.Stations = snapshot.Control.StationIndex()
 	r.control.Routes = make(map[string]model.RouteState)
@@ -598,6 +618,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Pressures = make(map[string]model.PressureState)
 	r.control.Tracking = make(map[string][]model.TrackingState)
 	r.control.Permits = make(map[string][]model.PermitState)
+	r.control.DegradedRuns = degraded
 	for _, value := range snapshot.Control.Routes {
 		r.control.Routes[value.ID] = value
 	}
@@ -616,9 +637,22 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	for _, value := range snapshot.Control.Permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
 	}
+	for _, runID := range degradedRuns {
+		r.control.Permits[runID] = append(r.control.Permits[runID], model.PermitState{
+			RunID:      runID,
+			Name:       "repressurization",
+			Generation: summaryGeneration(snapshot.Control, runID),
+			Granted:    false,
+			Reason:     "degraded after recovery: " + degraded[runID],
+			UpdatedAt:  time.Now().UTC(),
+		})
+	}
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	for _, runID := range degradedRuns {
+		r.recordIncident(runID, "warning", "passage evidence degraded after recovery: "+degraded[runID])
+	}
 	events, err := control.Persistent.Events()
 	if err != nil {
 		return RecoveryReport{}, err
@@ -628,6 +662,7 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 		RecoveredRoutes:  len(leasing),
 		RecoveredPermits: len(permitEvents),
 		JournalEvents:    len(events),
+		DegradedRuns:     degradedRuns,
 		Ready:            true,
 	}, nil
 }
@@ -715,6 +750,7 @@ func (r *Runtime) HealthDetails() map[string]any {
 		"persistent_checksum": checksum,
 		"validation_error":    errorText(validationError),
 		"route_leases":        len(route.Snapshot(r.Routes)),
+		"degraded_runs":       len(r.control.DegradedRuns),
 		"emergency_safe":      emergency.Safe(r.Pressure),
 		"pressure_samples":    len(r.Pressure.History()),
 		"recovery_steps":      recoverySteps,
@@ -731,6 +767,7 @@ func (r *Runtime) ReviseTracking(runID string) (int64, error) {
 		return 0, err
 	}
 	r.mu.Lock()
+	delete(r.control.DegradedRuns, runID)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
 	return generation, nil

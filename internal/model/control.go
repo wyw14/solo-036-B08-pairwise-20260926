@@ -98,6 +98,22 @@ type PermitState struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// ObservationState is the durable form of one raw tracking observation. It is
+// what passage judgments are derived from, so it must survive snapshot
+// recovery alongside the tracking and permit summaries.
+type ObservationState struct {
+	RunID               string    `json:"run_id"`
+	StationID           string    `json:"station_id"`
+	ObservationID       string    `json:"observation_id"`
+	PhysicalSourceID    string    `json:"physical_source_id"`
+	ParentObservationID string    `json:"parent_observation_id,omitempty"`
+	Kind                string    `json:"kind"`
+	Position            float64   `json:"position"`
+	Generation          int64     `json:"generation"`
+	ObservedAt          time.Time `json:"observed_at"`
+	Valid               bool      `json:"valid"`
+}
+
 type OperationRecord struct {
 	Run       Run             `json:"run"`
 	Route     RouteState      `json:"route"`
@@ -108,17 +124,18 @@ type OperationRecord struct {
 }
 
 type ControlSnapshot struct {
-	Revision   string          `json:"revision"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Stations   []Station       `json:"stations"`
-	Valves     []ValveState    `json:"valves"`
-	Closures   []ClosureState  `json:"closures"`
-	Pressures  []PressureState `json:"pressures"`
-	Routes     []RouteState    `json:"routes"`
-	Tracking   []TrackingState `json:"tracking"`
-	Permits    []PermitState   `json:"permits"`
-	Runs       []Run           `json:"runs"`
-	Incidents  []Incident      `json:"incidents"`
+	Revision     string             `json:"revision"`
+	CapturedAt   time.Time          `json:"captured_at"`
+	Stations     []Station          `json:"stations"`
+	Valves       []ValveState       `json:"valves"`
+	Closures     []ClosureState     `json:"closures"`
+	Pressures    []PressureState    `json:"pressures"`
+	Routes       []RouteState       `json:"routes"`
+	Tracking     []TrackingState    `json:"tracking"`
+	Observations []ObservationState `json:"observations"`
+	Permits      []PermitState      `json:"permits"`
+	Runs         []Run              `json:"runs"`
+	Incidents    []Incident         `json:"incidents"`
 }
 
 func (s Station) Validate() error {
@@ -221,6 +238,28 @@ func (p PermitState) Validate() error {
 	return nil
 }
 
+// Validate checks the structural identity of a raw observation. The source
+// kind enumeration belongs to the tracker domain and is validated there when
+// the lineage is rebuilt.
+func (o ObservationState) Validate(stations map[string]Station) error {
+	if o.RunID == "" || o.ObservationID == "" || o.PhysicalSourceID == "" {
+		return errors.New("observation identity is incomplete")
+	}
+	if _, ok := stations[o.StationID]; !ok {
+		return errors.New("observation references an unknown station")
+	}
+	if strings.TrimSpace(o.Kind) == "" {
+		return errors.New("observation source kind is required")
+	}
+	if o.Generation <= 0 {
+		return errors.New("observation generation must be positive")
+	}
+	if o.ObservedAt.IsZero() {
+		return errors.New("observation time is required")
+	}
+	return nil
+}
+
 func (s ControlSnapshot) StationIndex() map[string]Station {
 	out := make(map[string]Station, len(s.Stations))
 	for _, station := range s.Stations {
@@ -261,6 +300,11 @@ func (s ControlSnapshot) Validate() error {
 	for _, tracking := range s.Tracking {
 		if err := tracking.Validate(stations); err != nil {
 			return fmt.Errorf("tracking %s: %w", tracking.RunID, err)
+		}
+	}
+	for _, observation := range s.Observations {
+		if err := observation.Validate(stations); err != nil {
+			return fmt.Errorf("observation %s: %w", observation.ObservationID, err)
 		}
 	}
 	for _, permit := range s.Permits {
