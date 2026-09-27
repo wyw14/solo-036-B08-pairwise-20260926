@@ -53,11 +53,14 @@ type ReceiveRequest struct {
 }
 
 type RecoveryReport struct {
-	RecoveredRuns    int  `json:"recovered_runs"`
-	RecoveredRoutes  int  `json:"recovered_routes"`
-	RecoveredPermits int  `json:"recovered_permits"`
-	JournalEvents    int  `json:"journal_events"`
-	Ready            bool `json:"ready"`
+	RecoveredRuns     int  `json:"recovered_runs"`
+	RecoveredRoutes   int  `json:"recovered_routes"`
+	RecoveredPermits  int  `json:"recovered_permits"`
+	RecoveredTracking int  `json:"recovered_tracking"`
+	DegradedPermits   int  `json:"degraded_permits"`
+	DegradedTracking  int  `json:"degraded_tracking"`
+	JournalEvents     int  `json:"journal_events"`
+	Ready             bool `json:"ready"`
 }
 
 func defaultControlState() *ControlState {
@@ -340,7 +343,7 @@ func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationR
 		RunID:   runID,
 		Kind:    "tracking",
 		Epoch:   evidence.Generation,
-		Payload: fmt.Sprintf("%s/%s/%.3f", request.StationID, request.SourceID, request.Position),
+		Payload: fmt.Sprintf("%s/%s/%s/%.3f", request.StationID, request.SourceID, request.Kind, request.Position),
 		At:      request.ObservedAt,
 	}); err != nil {
 		return model.OperationRecord{}, err
@@ -564,6 +567,14 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	if err := snapshot.Control.Validate(); err != nil {
 		return RecoveryReport{}, err
 	}
+	events, err := control.Persistent.Events()
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	restored, err := tracker.Restore(r.Tracker, r.Lineage, events)
+	if err != nil {
+		return RecoveryReport{}, fmt.Errorf("rebuild tracking sources: %w", err)
+	}
 	run.Restore(r.Runs, snapshot.Control.Runs)
 	leasing := make([]model.RouteLease, 0)
 	for _, routeState := range snapshot.Control.Routes {
@@ -578,8 +589,14 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	}
 	route.Restore(r.Routes, leasing)
 	permitEvents := make([]model.Event, 0)
+	permits := make([]model.PermitState, 0, len(snapshot.Control.Permits))
+	degradedPermits := make([]model.PermitState, 0)
 	for _, permitState := range snapshot.Control.Permits {
-		if permitState.Granted {
+		if permitState.Granted && !r.Lineage.HasIndependentEvidence(permitState.RunID, permitState.Generation, 2) {
+			permitState.Granted = false
+			permitState.Reason = "recovery degraded: durable passage evidence is missing"
+			degradedPermits = append(degradedPermits, permitState)
+		} else if permitState.Granted {
 			permitEvents = append(permitEvents, model.Event{
 				RunID:   permitState.RunID,
 				Kind:    "passage",
@@ -588,8 +605,10 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 				Durable: true,
 			})
 		}
+		permits = append(permits, permitState)
 	}
 	permit.Restore(r.Permits, permitEvents)
+	tracking, degradedTracking := reconcileTracking(snapshot.Control.Tracking, restored)
 	r.mu.Lock()
 	r.control.Stations = snapshot.Control.StationIndex()
 	r.control.Routes = make(map[string]model.RouteState)
@@ -610,26 +629,88 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	for _, value := range snapshot.Control.Pressures {
 		r.control.Pressures[value.StationID] = value
 	}
-	for _, value := range snapshot.Control.Tracking {
+	for _, value := range tracking {
 		r.control.Tracking[value.RunID] = append(r.control.Tracking[value.RunID], value)
 	}
-	for _, value := range snapshot.Control.Permits {
+	for _, value := range permits {
 		r.control.Permits[value.RunID] = append(r.control.Permits[value.RunID], value)
 	}
 	r.control.Incidents = append([]model.Incident(nil), snapshot.Control.Incidents...)
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
-	events, err := control.Persistent.Events()
-	if err != nil {
-		return RecoveryReport{}, err
+	for _, permitState := range degradedPermits {
+		r.recordIncident(permitState.RunID, "warning", fmt.Sprintf("permit %s degraded during recovery: durable passage evidence is missing", permitState.Name))
+	}
+	for _, state := range degradedTracking {
+		r.recordIncident(state.RunID, "warning", fmt.Sprintf("tracking summary for %s/%s at generation %d has no durable observation", state.StationID, state.SourceID, state.Generation))
 	}
 	return RecoveryReport{
-		RecoveredRuns:    len(snapshot.Control.Runs),
-		RecoveredRoutes:  len(leasing),
-		RecoveredPermits: len(permitEvents),
-		JournalEvents:    len(events),
-		Ready:            true,
+		RecoveredRuns:     len(snapshot.Control.Runs),
+		RecoveredRoutes:   len(leasing),
+		RecoveredPermits:  len(permitEvents),
+		RecoveredTracking: len(restored),
+		DegradedPermits:   len(degradedPermits),
+		DegradedTracking:  len(degradedTracking),
+		JournalEvents:     len(events),
+		Ready:             true,
 	}, nil
+}
+
+// reconcileTracking aligns the persisted tracking summaries with the raw
+// observations rebuilt from the durable journal. A summary without a
+// backing observation is degraded to offline instead of being trusted, and
+// a durable observation missing from the snapshot is restored as a summary,
+// so the run, its generation, the raw observations, and the summary stay
+// aligned after recovery.
+func reconcileTracking(summaries []model.TrackingState, observations []tracker.SourceObservation) ([]model.TrackingState, []model.TrackingState) {
+	type key struct {
+		runID      string
+		stationID  string
+		sourceID   string
+		generation int64
+		observedAt time.Time
+	}
+	observed := make(map[key]bool, len(observations))
+	for _, observation := range observations {
+		observed[key{observation.RunID, observation.StationID, observation.PhysicalSourceID, observation.Generation, observation.ObservedAt}] = true
+	}
+	summarized := make(map[key]bool, len(summaries))
+	out := make([]model.TrackingState, 0, len(summaries)+len(observations))
+	degraded := make([]model.TrackingState, 0)
+	for _, summary := range summaries {
+		k := key{summary.RunID, summary.StationID, summary.SourceID, summary.Generation, summary.ObservedAt}
+		if observed[k] {
+			summarized[k] = true
+			out = append(out, summary)
+			continue
+		}
+		summary.Online = false
+		degraded = append(degraded, summary)
+		out = append(out, summary)
+	}
+	added := make([]model.TrackingState, 0)
+	for _, observation := range observations {
+		k := key{observation.RunID, observation.StationID, observation.PhysicalSourceID, observation.Generation, observation.ObservedAt}
+		if summarized[k] {
+			continue
+		}
+		added = append(added, model.TrackingState{
+			RunID:      observation.RunID,
+			StationID:  observation.StationID,
+			SourceID:   observation.PhysicalSourceID,
+			Generation: observation.Generation,
+			Position:   observation.Position,
+			Online:     true,
+			ObservedAt: observation.ObservedAt,
+		})
+	}
+	sort.Slice(added, func(i, j int) bool {
+		if added[i].ObservedAt.Equal(added[j].ObservedAt) {
+			return added[i].SourceID < added[j].SourceID
+		}
+		return added[i].ObservedAt.Before(added[j].ObservedAt)
+	})
+	return append(out, added...), degraded
 }
 
 func (r *Runtime) InterlockStatus() []model.Interlock {

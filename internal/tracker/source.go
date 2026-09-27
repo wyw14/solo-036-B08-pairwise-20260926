@@ -120,6 +120,24 @@ func (l *SourceLineage) Evidence(runID, stationID string, generation int64) []mo
 	return evidence
 }
 
+// HasIndependentEvidence reports whether the lineage still holds valid
+// observations from at least `required` independent physical sources for
+// the run at the given generation, all recorded at a single station.
+func (l *SourceLineage) HasIndependentEvidence(runID string, generation int64, required int) bool {
+	stations := make(map[string]bool)
+	for _, observation := range l.observations {
+		if observation.RunID == runID && observation.Generation == generation {
+			stations[observation.StationID] = true
+		}
+	}
+	for station := range stations {
+		if IndependentPhysicalArrival(l.Evidence(runID, station, generation), required) {
+			return true
+		}
+	}
+	return false
+}
+
 func IndependentPhysicalArrival(events []model.PassageEvidence, required int) bool {
 	if required <= 0 {
 		return false
